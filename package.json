@@ -1,0 +1,27 @@
+{
+  "name": "@u-tokyo/app",
+  "version": "1.0.0",
+  "description": "u-tokyo app.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/UTokyoStudents/u-tokyo.git"
+  },
+  "author": "東京大学教養学部学生自治会",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/UTokyoStudents/u-tokyo/issues"
+  },
+  "homepage": "https://github.com/UTokyoStudents/u-tokyo#readme",
+  "dependencies": {
+    "@google-cloud/dns": "^2.0.2",
+    "@google-cloud/firestore": "^4.4.0",
+    "express": "^4.17.1",
+    "googleapis": "^61.0.0",
+    "void-template": "^1.0.1"
+  }
+}
