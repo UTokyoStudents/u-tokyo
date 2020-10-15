@@ -1,5 +1,22 @@
 
-const OAUTH_SECRETS = require('./client_secret.json');
+/* Secrets! (not stored on the repository) */
+const OAUTH_SECRETS = require('./client_secret.json').web;
+
+/* Dependencies */
+const {google} = require('googleapis');
+const express = require('express');
+const {DNS} = require('@google-cloud/dns');
+const {Element, Document} = require('void-template');
+const Firestore = require('@google-cloud/firestore');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const {v4: uuidv4} = require('uuid');
+const { parse } = require('path');
+
+
+/* Definitions */
+const ECCS_HOSTED_DOMAIN = 'g.ecc.u-tokyo.ac.jp';
+const ECCS_ID_PATTERN = /^([0-9]{10})@g\.ecc\.u-tokyo\.ac\.jp$/;
 
 const DOMAIN = 'u-tokyo.app.';
 const TYPE_WHITELIST = [
@@ -7,13 +24,7 @@ const TYPE_WHITELIST = [
 ];
 const DEFAULT_TTL = 300;
 
-const {google} = require('googleapis');
-
-const oauth2Client = new google.auth.OAuth2(
-    OAUTH_SECRETS.client_id,
-    OAUTH_SECRETS.client_secret,
-    'https://www.u-tokyo.app/auth'
-);
+const AUTH_URL = 'https://www.u-tokyo.app/auth';
 
 const oauth2Scopes = [
     'openid',
@@ -21,20 +32,74 @@ const oauth2Scopes = [
     'profile',
 ];
 
-const express = require('express');
-const app = express();
-const {Element, Document} = require('void-template');
 
-const Firestore = require('@google-cloud/firestore');
+/* Global objects */
+
+const oauth2Client = new google.auth.OAuth2(
+    OAUTH_SECRETS.client_id,
+    OAUTH_SECRETS.client_secret,
+    AUTH_URL
+);
+
+const app = express();
 
 const db = new Firestore({
     projectId: 'utokyo',
 });
 
-const {DNS} = require('@google-cloud/dns');
+const oauth2 = google.oauth2('v2');
+const people = google.people('v1');
+
 const dns = new DNS();
 
 const zone = dns.zone('utokyo-app');
+
+
+class User
+{
+    static async getUserByUtokyoId(id)
+    {
+        const usersRef = db.collection('users');
+        const usersSnapshot = await usersRef.where('utokyo_id', '==', id).get();
+        if (usersSnapshot.empty) {
+            throw new Error('No such user');
+        }
+        const usersData = [];
+        usersSnapshot.forEach(doc => usersData.push(doc.data()));
+        return usersData[0];
+    }
+
+    static async initializeUserByUtokyoId(id)
+    {
+        try {
+            return await User.getUserByUtokyoId(id);
+        } catch (e) {
+            const usersRef = db.collection('users');
+            await usersRef.doc().set({
+                utokyo_id: id,
+                created_date: Firestore.FieldValue.serverTimestamp(),
+                user_secret: crypto.randomBytes(32).toString('hex'),
+            });
+            return await User.getUserByUtokyoId(id);
+        }
+    }
+
+    static async getUserTokenByUtokyoId(id)
+    {
+        const user = await User.initializeUserByUtokyoId(id);
+        return jwt.sign({
+            id: user.utokyo_id,
+        }, user.user_secret, {
+            expiresIn: 60 * 60 * 24, // one day
+        });
+    }
+
+    static async verifyUserToken(id, token)
+    {
+        const user = await User.getUserByUtokyoId(id);
+        return jwt.verify(token, user.user_secret);
+    }
+}
 
 class Subdomain
 {
@@ -209,17 +274,167 @@ class Subdomain
             this.removeSubdomain(subdomain);
         }
     }
+
+    static async domainExists(aName)
+    {
+        const domainsRef = db.collection('domains');
+        const name = String(aName).toLowerCase();
+        if (name.includes('.')) {
+            throw new TypeError('Not a top-level subdomain');
+        }
+        const domainsSnapshot = await domainsRef.where('subdomains', 'array-contains', name).get();
+        return !domainsSnapshot.empty;
+    }
+
+    static async createSubdomain(aName, aOwner)
+    {
+        const domainsRef = db.collection('domains');
+        const name = String(aName).toLowerCase();
+
+        if (!name.match(/^[a-z0-9]+(-[a-z0-9]+)*$/)) {
+            throw new Error('Invalid name');
+        }
+        const exists = await Subdomain.domainExists(name);
+        if (exists) {
+            throw new Error('Domain already exists');
+        }
+
+        const id = uuidv4();
+        await domainsRef.doc(id).set({
+            created_by: aOwner,
+            created_date: Firestore.FieldValue.serverTimestamp(),
+            subdomains: [name],
+        });
+
+        return id;
+    }
 }
 
+const parseCookies = header => {
+    const cookies = Object.create(null);
+    if (!header) {
+        return cookies;
+    }
+    String(header).split('; ').forEach(rawCookie => {
+        const [key, value] = rawCookie.split('=');
+        cookies[key] = value;
+    });
+    return cookies;
+};
+
 app.get('/', (req, res) => {
+    const cookies = parseCookies(req.headers.cookie);
+    const user_id = cookies.utokyo_id || '';
+    const user_token = cookies.utokyo_token || '';
     const document = new Document;
-    const script = document.createElement ('script');
-    script.setAttribute ('type', 'module');
-    script.setAttribute ('src', '/main.mjs');
-    document.head.append (script);
+    document.documentElement.setAttribute('data-user_id', user_id);
+    document.documentElement.setAttribute('data-user_token', user_token);
+    
     document.title = 'Test document';
 
     res.send(document + '');
+});
+
+
+app.get('/login', async (req, res) => {
+    const url = oauth2Client.generateAuthUrl({
+        access_type: 'online',
+        scope: oauth2Scopes,
+    });
+    res.redirect(url + '&hd=' + ECCS_HOSTED_DOMAIN);
+});
+
+app.get('/auth', async (req, res) => {
+    try {
+        const code = req.query.code;
+        if (!code) throw new Error('No code provided');
+        const {tokens} = await oauth2Client.getToken(code);
+        oauth2Client.setCredentials(tokens);
+        google.options({auth: oauth2Client});
+
+        const person = (await people.people.get({
+            resourceName: 'people/me',
+            personFields: 'emailAddresses',
+        })).data;
+
+        const utokyoIds = [];
+        for (const obj of person.emailAddresses) {
+            if ('string' != typeof obj.value) continue;
+            const matches = obj.value.match(ECCS_ID_PATTERN);
+            if (matches) {
+                utokyoIds.push(matches[1]);
+            }
+        }
+
+        if (utokyoIds.length < 1) {
+            throw new Error('No UTokyo account ID available for account');
+        }
+
+        const utokyo_id = utokyoIds[0];
+        const token = await User.getUserTokenByUtokyoId(utokyo_id);
+
+        res.cookie('utokyo_id', utokyo_id, {
+            maxAge: 60 * 60 * 24,
+            httpOnly: true,
+            secure: true,
+            sameSite: 'lax',
+        });
+
+        res.cookie('utokyo_token', token, {
+            maxAge: 60 * 60 * 24,
+            httpOnly: true,
+            secure: true,
+            sameSite: 'lax',
+        });
+
+        res.redirect('/');
+    } catch (e) {
+        console.error(e);
+        res.status(400).contentType('application/json').send(JSON.stringify({
+            error: e + '',
+        }));
+    }
+});
+
+app.post('/internal/create-domain', async (req, res) => {
+    try {
+        const cookies = Object.create(null);
+        if (!req.query.user_id || !req.query.user_token) {
+            throw new Error('No token provided');
+        }
+
+        await User.verifyUserToken(req.query.user_id, req.query.user_token);
+
+        // verified
+        if (!req.query.name) {
+            throw new Error('Domain name not provided');
+        }
+
+        const id = await Subdomain.createSubdomain(req.query.name, req.query.user_id);
+        res.status(200).contentType('application/json').send(JSON.stringify({
+            id,
+        }));
+    } catch (e) {
+        console.error(e);
+        res.status(400).contentType('application/json').send(JSON.stringify({
+            error: e + '',
+        }));
+    }
+});
+
+app.get('/api/v1/domain-info/:domain_id', async (req, res) => {
+    try {
+        const obj = new Subdomain(req.params.domain_id);
+        const subdomains = await obj.getBaseSubdomains();
+        res.status(200).contentType('application/json').send(JSON.stringify({
+            subdomains,
+        }));
+    } catch (e) {
+        console.error(e);
+        res.status(400).contentType('application/json').send(JSON.stringify({
+            error: e + '',
+        }));
+    }
 });
 
 app.get('/api/v1/list-records/:domain_id', async (req, res) => {
